@@ -5,10 +5,9 @@ import ConfigParser
 import datetime
 import logging
 import os
+import subprocess
 import threading
 import time
-
-import boto.ec2
 
 
 logging.basicConfig(
@@ -26,11 +25,13 @@ class Config(object):
         'ec2_access_key',
         'ec2_secret_key',
         'ec2_location',
+        'persistent_cidrs',
     ]
 
     LIST_TYPE = [
         'api_keys',
-        'target_ports'
+        'target_ports',
+        'persistent_cidrs'
     ]
 
     INT_TYPE = [
@@ -82,30 +83,25 @@ class IPAM(object):
         self.lock = threading.Lock()
         self._target = {}
 
-    def put(self, ip):
+    def put(self, ruleid):
         self.lock.acquire()
         try:
-            self._target[ip] = datetime.datetime.now()
-            logging.debug("authorize ip:%s, time:%s" % (ip, self._target[ip]))
+            self._target[ruleid] = datetime.datetime.now()
+            logging.debug("authorize ruleid:%s, time:%s" % (ruleid, self._target[ruleid]))
         finally:
             self.lock.release()
 
     def pop_expired(self):
-        """
-        revoke対象のIPを返す
-        ない場合はNoneを返す
-        この際返却したIPはリストから削除される
-        """
         self.lock.acquire()
         try:
-            for ip, last_access in self._target.items():
+            for ruleid, last_access in self._target.items():
                 if self._is_expired(last_access):
-                    logging.debug("expired : %s" % ip)
-                    found = ip
+                    logging.debug("expired : %s" % ruleid)
+                    found = ruleid
                     break
             else:
                 return None
-            # remove ip
+            # remove rule
             del self._target[found]
             return found
         finally:
@@ -113,7 +109,11 @@ class IPAM(object):
 
     def _is_expired(self, timestamp):
         now = datetime.datetime.now()
-        if (now - timestamp).total_seconds() > self.limit:
+        # logging.debug("_is_expired: now = %s, timestamp = %s" % (now, timestamp))
+        duration = now - timestamp
+        total_seconds = (duration.microseconds + (duration.seconds + duration.days * 24 * 3600) * 10**6) / 10**6
+        # logging.debug("total_seconds: %s, limit: %s" % (total_seconds, self.limit))
+        if total_seconds > self.limit:
             return True
         return False
 
@@ -127,9 +127,9 @@ class Revoker(threading.Thread):
     def run(self):
         while True:
             try:
-                ip = self.ipam.pop_expired()
-                if ip:
-                    revoke(ip)
+                ruleid = self.ipam.pop_expired()
+                if ruleid:
+                    revoke(ruleid)
             except Exception as e:
                 logging.error(e)
             time.sleep(1)
@@ -147,25 +147,29 @@ def authenticate(api_key):
     return api_key in CONF.api_keys
 
 
-def connect():
-    return boto.ec2.connect_to_region(CONF.ec2_location,
-                                      aws_access_key_id=CONF.ec2_access_key,
-                                      aws_secret_access_key=CONF.ec2_secret_key
-                                      )
-
-
 def authorize(remote_ip):
+    ruleid = ""
     logging.debug("authorizing: %s" % remote_ip)
-    conn = connect()
     for target_port in CONF.target_ports:
         try:
-            conn.authorize_security_group(
-                group_name=CONF.sec_group,
-                ip_protocol="tcp",
-                from_port=target_port,
-                to_port=target_port,
-                cidr_ip="%s/32" % remote_ip
-            )
+            cmd = ["/usr/bin/cloudmonkey",
+                   "authorizeSecurityGroupIngress",
+                   "securitygroupname=%s" % CONF.sec_group,
+                   "cidrlist=%s/32" % remote_ip,
+                   "startport=%s" % target_port,
+                   "endport=%s" % target_port,
+                   "protocol=tcp"
+                  ]
+            p = subprocess.Popen(cmd,
+                                 stdin=subprocess.PIPE,
+                                 stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE,
+                                 shell=False)
+            for line in p.stdout.readlines():
+                if line.lstrip().startswith('ruleid = '):
+                    ruleid = line.split('=', 1)[1].strip()
+                    break
+
         except Exception as e:
             logging.error("Failed to authorize remote_ip: %s port: %s" % (
                             remote_ip, target_port)
@@ -173,24 +177,24 @@ def authorize(remote_ip):
             logging.error(e)
 
     global ipam
-    ipam.put(remote_ip)
+    ipam.put(ruleid)
 
 
-def revoke(remote_ip):
-    logging.debug("revoking : %s" % remote_ip)
-    conn = connect()
+def revoke(ruleid):
+    logging.debug("revoking : %s" % ruleid)
     for target_port in CONF.target_ports:
         try:
-            conn.revoke_security_group(
-                group_name=CONF.sec_group,
-                ip_protocol="tcp",
-                from_port=target_port,
-                to_port=target_port,
-                cidr_ip="%s/32" % remote_ip
-            )
+            cmd = ["/usr/bin/cloudmonkey",
+                   "revokeSecurityGroupIngress",
+                   "id=%s" % ruleid]
+            p = subprocess.Popen(cmd,
+                                 stdin=subprocess.PIPE,
+                                 stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE,
+                                 shell=False)
         except Exception as e:
-            logging.error("Failed to revoke remote_ip: %s port: %s" % (
-                            remote_ip, target_port)
+            logging.error("Failed to revoke ruleid: %s port: %s" % (
+                            ruleid, target_port)
                          )
             logging.error(e)
 
@@ -201,6 +205,40 @@ def render_response(start_response, data, code):
         ("Content-Length", str(len(data)))
     ])
     return iter([data])
+
+
+def persistent_auth():
+    #cidrs = CONF.persistent_cidrs
+    #logging.debug("persistent cidrs: %s" % cidrs)
+    for cidr in CONF.persistent_cidrs:
+        logging.debug("persistent authorizing: %s" % cidr)
+        for target_port in CONF.target_ports:
+            try:
+                cmd = ["/usr/bin/cloudmonkey",
+                       "authorizeSecurityGroupIngress",
+                       "securitygroupname=%s" % CONF.sec_group,
+                       "cidrlist=%s" % cidr,
+                       "startport=%s" % target_port,
+                       "endport=%s" % target_port,
+                       "protocol=tcp"
+                      ]
+                p = subprocess.Popen(cmd,
+                                     stdin=subprocess.PIPE,
+                                     stdout=subprocess.PIPE,
+                                     stderr=subprocess.PIPE,
+                                     shell=False)
+                for line in p.stdout.readlines():
+                    if line.lstrip().startswith('ruleid = '):
+                        ruleid = line.split('=', 1)[1].strip()
+                        logging.debug("authorized cidr:%s, rule: %s" % (
+                                      cidr, ruleid))
+                        break
+
+            except Exception as e:
+                logging.error("Failed to authorize cidr: %s port: %s" % (
+                                cidr, target_port)
+                             )
+                logging.error(e)
 
 
 def app(environ, start_response):
@@ -224,6 +262,7 @@ def app(environ, start_response):
 
 
 CONF = Config()
+persistent_auth()
 ipam = IPAM(CONF.revoke_interval)
 revoker = Revoker(ipam)
 revoker.start()
