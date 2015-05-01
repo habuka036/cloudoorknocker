@@ -160,7 +160,7 @@ def authorize(remote_ip):
     for target_port in CONF.target_ports:
         try:
             conn.authorize_security_group(
-                group_name=CONF.sec_group,
+                group_id=CONF.sec_group,
                 ip_protocol="tcp",
                 from_port=target_port,
                 to_port=target_port,
@@ -182,7 +182,7 @@ def revoke(remote_ip):
     for target_port in CONF.target_ports:
         try:
             conn.revoke_security_group(
-                group_name=CONF.sec_group,
+                group_id=CONF.sec_group,
                 ip_protocol="tcp",
                 from_port=target_port,
                 to_port=target_port,
