@@ -26,11 +26,13 @@ class Config(object):
         'ec2_access_key',
         'ec2_secret_key',
         'ec2_location',
+        'persistent_cidrs',
     ]
 
     LIST_TYPE = [
         'api_keys',
-        'target_ports'
+        'target_ports',
+        'persistent_cidrs'
     ]
 
     INT_TYPE = [
@@ -167,9 +169,8 @@ def authorize(remote_ip):
                 cidr_ip="%s/32" % remote_ip
             )
         except Exception as e:
-            logging.error("Failed to authorize remote_ip: %s port: %s" % (
-                            remote_ip, target_port)
-                         )
+            logging.error("Failed to authorize remote_ip: %s port: %s" %
+                          (remote_ip, target_port))
             logging.error(e)
 
     global ipam
@@ -189,9 +190,8 @@ def revoke(remote_ip):
                 cidr_ip="%s/32" % remote_ip
             )
         except Exception as e:
-            logging.error("Failed to revoke remote_ip: %s port: %s" % (
-                            remote_ip, target_port)
-                         )
+            logging.error("Failed to revoke remote_ip: %s port: %s" %
+                          (remote_ip, target_port))
             logging.error(e)
 
 
@@ -201,6 +201,25 @@ def render_response(start_response, data, code):
         ("Content-Length", str(len(data)))
     ])
     return iter([data])
+
+
+def persistent_auth():
+    conn = connect()
+    for cidr in CONF.persistent_cidrs:
+        logging.debug("persistent authorizing: %s" % cidr)
+        for target_port in CONF.target_ports:
+            try:
+                conn.authorize_security_group(
+                    group_id=CONF.sec_group,
+                    ip_protocol="tcp",
+                    from_port=target_port,
+                    to_port=target_port,
+                    cidr_ip=cidr
+                )
+            except Exception as e:
+                logging.error("Failed to authorize cidr: %s port: %s" %
+                              (cidr, target_port))
+                logging.error(e)
 
 
 def app(environ, start_response):
@@ -224,6 +243,7 @@ def app(environ, start_response):
 
 
 CONF = Config()
+persistent_auth()
 ipam = IPAM(CONF.revoke_interval)
 revoker = Revoker(ipam)
 revoker.start()
